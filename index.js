@@ -115,10 +115,38 @@ async function fetchInbox() {
       if (res.status === 401) return null;   // señal de re-auth
       if (!res.ok) { warn('inbox', ep.url.slice(-40), res.status); continue; }
       const data = await res.json();
-      // Log estructura la primera vez
-      if (Object.keys(prevStates).length === 0) {
-        const sample = (data?.list ?? data?.data ?? data?.conversations ?? data?.items ?? (Array.isArray(data) ? data : []))[0];
-        if (sample) log('estructura inbox (primer item):', Object.keys(sample).join(', ').slice(0, 200));
+      // Debug: escribir estructura inbox a Supabase para diagnóstico
+      {
+        const items = data?.list ?? data?.data ?? data?.conversations ?? data?.records ??
+          data?.pageList ?? data?.items ?? data?.inboxList ?? (Array.isArray(data) ? data : []);
+        const sample = Array.isArray(items) ? items[0] : null;
+        const debugInfo = {
+          endpoint: ep.url.slice(-50),
+          itemCount: Array.isArray(items) ? items.length : -1,
+          topLevelKeys: Object.keys(data || {}).join(',').slice(0, 100),
+          sampleKeys: sample ? Object.keys(sample).join(',').slice(0, 200) : 'NO_SAMPLE',
+          sampleAgentFields: sample ? JSON.stringify({
+            agentId: sample.agentId,
+            assigneeId: sample.assigneeId,
+            assignedAgentId: sample.assignedAgentId,
+            assignedTo: sample.assignedTo,
+            agentObj: sample.agent,
+            assigneeObj: sample.assignee,
+          }).slice(0, 300) : 'NO_SAMPLE',
+          ts: new Date().toISOString(),
+        };
+        await fetch(`${SUPA_URL}/debug_watcher`, {
+          method: 'POST',
+          headers: { ...SUPA_HEADERS, Prefer: 'resolution=merge-duplicates' },
+          body: JSON.stringify({ id: 1, ...debugInfo }),
+        }).catch(() => {});
+        // Fallback: store in memoria_ram telefono=0000000000
+        await fetch(`${SUPA_URL}/memoria_ram?telefono=eq.0000000000`, {
+          method: 'PATCH',
+          headers: SUPA_HEADERS,
+          body: JSON.stringify({ historial: JSON.stringify(debugInfo) }),
+        }).catch(() => {});
+        log('debug inbox:', debugInfo.itemCount, 'items, keys:', debugInfo.sampleKeys.slice(0, 80));
       }
       return data;
     } catch (e) {
