@@ -12,24 +12,64 @@ const POLL_MS    = 10_000;   // cada 10s
 // phone (sin +) → { isAssigned: bool, agentId: string|null, convId: string }
 const prevStates = {};
 
+// cookieStr mutable — se actualiza cuando SESSION se renueva automáticamente
+let cookieStr = process.env.YC_COOKIE || null;
+
 // ── Logging ───────────────────────────────────────────────────────
 const log  = (...a) => console.log('[watcher]', new Date().toISOString().slice(11,19), ...a);
 const warn = (...a) => console.warn('[watcher]', new Date().toISOString().slice(11,19), ...a);
 
-// ── Auth: Bearer token estático desde env var ─────────────────────
-// Cómo obtener el token:
-//   1. Abrí https://www.ycloud.com/smb/inbox en Chrome
-//   2. DevTools → Network → filtrá por "api/inbox"
-//   3. Copiá el header Authorization de cualquier request
-//   4. Seteá en EasyPanel: YC_TOKEN=Bearer eyJ...
-function getAuthToken() {
-  const token = process.env.YC_TOKEN;
-  if (!token) {
-    warn('YC_TOKEN no configurado — detección de asignaciones deshabilitada');
-    warn('Para habilitarla: obtené el token de YCloud DevTools y seteá YC_TOKEN en EasyPanel');
-    return null;
+// ── Renovar SESSION usando remember-me cookie ─────────────────────
+// Cuando el SESSION expira, el remember-me permite obtener uno nuevo sin Puppeteer.
+async function renewSession() {
+  if (!cookieStr) return false;
+
+  const rememberMe = cookieStr.split(';')
+    .map(s => s.trim())
+    .find(s => s.startsWith('remember-me='));
+
+  if (!rememberMe) {
+    warn('No hay remember-me cookie — no se puede renovar SESSION automáticamente');
+    warn('Actualizá YC_COOKIE en EasyPanel con cookies frescas de DevTools');
+    return false;
   }
-  return token;
+
+  log('SESSION expirado — renovando con remember-me...');
+  try {
+    const res = await fetch(`${YC_BASE}/smb/inbox`, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: {
+        'Cookie': rememberMe,
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/149 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,*/*',
+      }
+    });
+
+    const setCookies = res.headers.getSetCookie?.() ?? [];
+    const newSession = setCookies.find(c => c.startsWith('SESSION='));
+
+    if (!newSession) {
+      warn('renewSession: no recibí SESSION cookie nuevo — remember-me puede haber expirado');
+      return false;
+    }
+
+    // Extraer solo "SESSION=valor" sin atributos (expires, path, etc.)
+    const sessionPair = newSession.split(';')[0].trim();
+
+    // Reemplazar SESSION viejo en cookieStr
+    if (cookieStr.includes('SESSION=')) {
+      cookieStr = cookieStr.replace(/SESSION=[^;]*(;|$)/, `${sessionPair}$1`);
+    } else {
+      cookieStr = `${cookieStr}; ${sessionPair}`;
+    }
+
+    log('SESSION renovado OK:', sessionPair.slice(0, 30) + '...');
+    return true;
+  } catch (e) {
+    warn('renewSession error:', e.message);
+    return false;
+  }
 }
 
 // ── Headers para llamadas internas YCloud ─────────────────────────
@@ -37,12 +77,11 @@ function buildHeaders() {
   const h = {
     'Content-Type': 'application/json',
     'Accept': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-    'Referer': `${YC_BASE}/smb/inbox`,
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/149 Safari/537.36',
+    'Referer': `${YC_BASE}/inbox-web`,
     'Origin': YC_BASE,
   };
-  const token = getAuthToken();
-  if (token) h['Authorization'] = token;
+  if (cookieStr) h['Cookie'] = cookieStr;
   return h;
 }
 
@@ -54,29 +93,33 @@ const INBOX_ENDPOINTS = [
 ];
 
 async function fetchInbox() {
-  const token = getAuthToken();
-  if (!token) return undefined;  // sin token, skip silencioso
+  if (!cookieStr) return undefined;
 
   for (const ep of INBOX_ENDPOINTS) {
     try {
       const opts = { method: ep.method, headers: buildHeaders() };
       if (ep.body) opts.body = JSON.stringify(ep.body);
       const res = await fetch(ep.url, opts);
-      if (res.status === 401) {
-        warn('YCloud 401 — token expirado. Renovar YC_TOKEN en EasyPanel:');
-        warn('  1. Chrome → https://www.ycloud.com/smb/inbox');
-        warn('  2. DevTools → Network → cualquier request a /api/inbox');
-        warn('  3. Copiar header Authorization → actualizar variable en EasyPanel');
-        return null;
+
+      if (res.status === 401 || res.status === 403) {
+        const renewed = await renewSession();
+        if (!renewed) {
+          warn('No se pudo renovar sesión. Actualizá YC_COOKIE en EasyPanel:');
+          warn('  Chrome → https://www.ycloud.com/inbox-web');
+          warn('  DevTools → Network → cualquier request a /api/inbox');
+          warn('  Click en Headers → copiar el valor completo de "cookie:"');
+          warn('  EasyPanel → necobot_watcher → Variables → YC_COOKIE = ese valor');
+        }
+        return null;  // señal: volver a intentar en próximo tick
       }
+
       if (!res.ok) { warn('inbox', ep.url.slice(-40), res.status); continue; }
-      const data = await res.json();
-      return data;
+      return await res.json();
     } catch (e) {
       warn('fetchInbox error:', ep.url.slice(-40), e.message);
     }
   }
-  return undefined;  // error de red, reintentar en próximo tick
+  return undefined;  // error de red
 }
 
 // ── Parsear items del inbox → { phone, convId, isAssigned, agentId } ──
@@ -151,7 +194,7 @@ async function supabaseGetExpired() {
 
 // ── YCloud: desasignar conversación (cuando pausa expira) ─────────
 async function unassignConv(convId) {
-  if (!convId || !getAuthToken()) return false;
+  if (!convId || !cookieStr) return false;
   const payloads = [
     { conversationId: convId, unassigned: true, agentId: '', teamId: '' },
     { inboxConversationId: convId, unassigned: true },
@@ -200,9 +243,8 @@ async function handleExpiredPaused(convMap) {
 // ── Loop principal de polling ─────────────────────────────────────
 async function poll() {
   const data = await fetchInbox();
-
-  if (data === null) return;  // 401 ya logueado con instrucciones
-  if (!data) return;          // error de red, reintentar en próximo tick
+  if (data === null) return;   // 401 — sesión renovada o instrucciones logueadas, reintentar
+  if (!data) return;           // error de red
 
   const conversations = parseConversations(data);
   log(`inbox: ${conversations.length} conversaciones`);
@@ -241,28 +283,28 @@ async function poll() {
 // ── Loop independiente de expiración (no requiere auth YCloud) ───
 async function expiryLoop() {
   try {
-    await handleExpiredPaused({});  // convMap vacío — sin desasignar en YCloud
+    await handleExpiredPaused({});
   } catch (e) {
     warn('expiryLoop error:', e.message);
   }
-  setTimeout(expiryLoop, 30_000);  // cada 30s
+  setTimeout(expiryLoop, 30_000);
 }
 
 // ── Arranque ──────────────────────────────────────────────────────
 async function main() {
   log('iniciando NecoBot YCloud Watcher');
 
-  const token = getAuthToken();
-  if (token) {
-    log('YC_TOKEN detectado — detección de asignaciones activa');
+  if (cookieStr) {
+    log('YC_COOKIE detectado — detección de asignaciones activa');
+    const hasRememberMe = cookieStr.includes('remember-me=');
+    log('remember-me cookie:', hasRememberMe ? 'presente (auto-renovación activa)' : 'AUSENTE (renovación manual cuando expire SESSION)');
   } else {
-    log('YC_TOKEN ausente — solo loop de expiración activo');
+    log('YC_COOKIE ausente — solo loop de expiración activo');
   }
 
-  // Loop de expiración siempre activo, independiente del token YCloud
   expiryLoop();
 
-  if (!token) return;
+  if (!cookieStr) return;
 
   async function loop() {
     try {
