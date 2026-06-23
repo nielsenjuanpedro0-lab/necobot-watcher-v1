@@ -10,7 +10,7 @@ const YC_EMAIL   = process.env.YC_EMAIL;
 const YC_PASSWORD= process.env.YC_PASSWORD;
 const SUPA_URL   = 'https://qukgtlwessujumdmfgnm.supabase.co/rest/v1';
 const SUPA_KEY   = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF1a2d0bHdlc3N1anVtZG1mZ25tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjM3MjY1MCwiZXhwIjoyMDg3OTQ4NjUwfQ.iWPH9PEGNixiZUPl8f-pJLv7dl6wBeOEw9psOnlrMq4';
-const POLL_MS    = 30_000;   // cada 30s
+const POLL_MS    = 10_000;   // cada 10s
 const REAUTH_MS  = 3 * 60 * 60 * 1000; // reloguear cada 3h
 
 // ── Estado en memoria ─────────────────────────────────────────────
