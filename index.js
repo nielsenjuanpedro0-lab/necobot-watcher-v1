@@ -2,87 +2,34 @@
 // Desplegado en EasyPanel, corre 24/7, actualiza Supabase
 'use strict';
 
-const puppeteer = require('puppeteer');
-
 // ── Config ────────────────────────────────────────────────────────
 const YC_BASE    = 'https://www.ycloud.com';
-const YC_EMAIL   = process.env.YC_EMAIL;
-const YC_PASSWORD= process.env.YC_PASSWORD;
 const SUPA_URL   = 'https://qukgtlwessujumdmfgnm.supabase.co/rest/v1';
 const SUPA_KEY   = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF1a2d0bHdlc3N1anVtZG1mZ25tIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjM3MjY1MCwiZXhwIjoyMDg3OTQ4NjUwfQ.iWPH9PEGNixiZUPl8f-pJLv7dl6wBeOEw9psOnlrMq4';
 const POLL_MS    = 10_000;   // cada 10s
-const REAUTH_MS  = 3 * 60 * 60 * 1000; // reloguear cada 3h
 
 // ── Estado en memoria ─────────────────────────────────────────────
 // phone (sin +) → { isAssigned: bool, agentId: string|null, convId: string }
 const prevStates = {};
 
-let authToken  = null;
-let cookieStr  = null;
-let lastAuth   = 0;
-
 // ── Logging ───────────────────────────────────────────────────────
 const log  = (...a) => console.log('[watcher]', new Date().toISOString().slice(11,19), ...a);
 const warn = (...a) => console.warn('[watcher]', new Date().toISOString().slice(11,19), ...a);
 
-// ── Autenticar con Puppeteer ──────────────────────────────────────
-async function authenticate() {
-  if (!YC_EMAIL || !YC_PASSWORD) {
-    warn('YC_EMAIL / YC_PASSWORD no configurados');
-    return false;
+// ── Auth: Bearer token estático desde env var ─────────────────────
+// Cómo obtener el token:
+//   1. Abrí https://www.ycloud.com/smb/inbox en Chrome
+//   2. DevTools → Network → filtrá por "api/inbox"
+//   3. Copiá el header Authorization de cualquier request
+//   4. Seteá en EasyPanel: YC_TOKEN=Bearer eyJ...
+function getAuthToken() {
+  const token = process.env.YC_TOKEN;
+  if (!token) {
+    warn('YC_TOKEN no configurado — detección de asignaciones deshabilitada');
+    warn('Para habilitarla: obtené el token de YCloud DevTools y seteá YC_TOKEN en EasyPanel');
+    return null;
   }
-  log('autenticando en YCloud...');
-
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: [
-        '--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu',
-        '--disable-dev-shm-usage', '--no-first-run', '--no-zygote'
-      ]
-    });
-
-    const page = await browser.newPage();
-    let captured = null;
-
-    // Capturar token de las requests que hace YCloud
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      const auth = req.headers()['authorization'];
-      if (auth && !auth.includes(SUPA_KEY) && auth.startsWith('Bearer ')) {
-        captured = auth;
-      }
-      req.continue();
-    });
-
-    // Login
-    await page.goto(`${YC_BASE}/login`, { waitUntil: 'networkidle2', timeout: 45_000 });
-    await page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="mail"]', { timeout: 15_000 });
-    await page.type('input[type="email"], input[name="email"], input[placeholder*="mail"]', YC_EMAIL, { delay: 50 });
-    await page.type('input[type="password"]', YC_PASSWORD, { delay: 50 });
-    await page.keyboard.press('Enter');
-
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30_000 });
-
-    // Navegar al inbox para que YCloud dispare requests autenticadas
-    await page.goto(`${YC_BASE}/smb/inbox`, { waitUntil: 'networkidle2', timeout: 30_000 });
-    await new Promise(r => setTimeout(r, 4_000));
-
-    const raw = await page.cookies();
-    cookieStr = raw.map(c => `${c.name}=${c.value}`).join('; ');
-    authToken = captured;
-    lastAuth  = Date.now();
-
-    log('auth OK — token:', authToken ? authToken.slice(0, 40) + '...' : 'null');
-    return !!authToken;
-  } catch (e) {
-    warn('auth error:', e.message);
-    return false;
-  } finally {
-    if (browser) await browser.close();
-  }
+  return token;
 }
 
 // ── Headers para llamadas internas YCloud ─────────────────────────
@@ -94,8 +41,8 @@ function buildHeaders() {
     'Referer': `${YC_BASE}/smb/inbox`,
     'Origin': YC_BASE,
   };
-  if (authToken) h['Authorization'] = authToken;
-  if (cookieStr) h['Cookie'] = cookieStr;
+  const token = getAuthToken();
+  if (token) h['Authorization'] = token;
   return h;
 }
 
@@ -107,53 +54,29 @@ const INBOX_ENDPOINTS = [
 ];
 
 async function fetchInbox() {
+  const token = getAuthToken();
+  if (!token) return undefined;  // sin token, skip silencioso
+
   for (const ep of INBOX_ENDPOINTS) {
     try {
       const opts = { method: ep.method, headers: buildHeaders() };
       if (ep.body) opts.body = JSON.stringify(ep.body);
       const res = await fetch(ep.url, opts);
-      if (res.status === 401) return null;   // señal de re-auth
+      if (res.status === 401) {
+        warn('YCloud 401 — token expirado. Renovar YC_TOKEN en EasyPanel:');
+        warn('  1. Chrome → https://www.ycloud.com/smb/inbox');
+        warn('  2. DevTools → Network → cualquier request a /api/inbox');
+        warn('  3. Copiar header Authorization → actualizar variable en EasyPanel');
+        return null;
+      }
       if (!res.ok) { warn('inbox', ep.url.slice(-40), res.status); continue; }
       const data = await res.json();
-      // Debug: escribir estructura inbox a Supabase para diagnóstico
-      {
-        const items = data?.list ?? data?.data ?? data?.conversations ?? data?.records ??
-          data?.pageList ?? data?.items ?? data?.inboxList ?? (Array.isArray(data) ? data : []);
-        const sample = Array.isArray(items) ? items[0] : null;
-        const debugInfo = {
-          endpoint: ep.url.slice(-50),
-          itemCount: Array.isArray(items) ? items.length : -1,
-          topLevelKeys: Object.keys(data || {}).join(',').slice(0, 100),
-          sampleKeys: sample ? Object.keys(sample).join(',').slice(0, 200) : 'NO_SAMPLE',
-          sampleAgentFields: sample ? JSON.stringify({
-            agentId: sample.agentId,
-            assigneeId: sample.assigneeId,
-            assignedAgentId: sample.assignedAgentId,
-            assignedTo: sample.assignedTo,
-            agentObj: sample.agent,
-            assigneeObj: sample.assignee,
-          }).slice(0, 300) : 'NO_SAMPLE',
-          ts: new Date().toISOString(),
-        };
-        await fetch(`${SUPA_URL}/debug_watcher`, {
-          method: 'POST',
-          headers: { ...SUPA_HEADERS, Prefer: 'resolution=merge-duplicates' },
-          body: JSON.stringify({ id: 1, ...debugInfo }),
-        }).catch(() => {});
-        // Fallback: store in memoria_ram telefono=0000000000
-        await fetch(`${SUPA_URL}/memoria_ram?telefono=eq.0000000000`, {
-          method: 'PATCH',
-          headers: SUPA_HEADERS,
-          body: JSON.stringify({ historial: JSON.stringify(debugInfo) }),
-        }).catch(() => {});
-        log('debug inbox:', debugInfo.itemCount, 'items, keys:', debugInfo.sampleKeys.slice(0, 80));
-      }
       return data;
     } catch (e) {
       warn('fetchInbox error:', ep.url.slice(-40), e.message);
     }
   }
-  return undefined;  // error, pero no 401
+  return undefined;  // error de red, reintentar en próximo tick
 }
 
 // ── Parsear items del inbox → { phone, convId, isAssigned, agentId } ──
@@ -180,8 +103,7 @@ function parseConversations(data) {
 
     const phone = rawPhone.replace(/\D/g, '');
     if (phone.length < 10 || phone.length > 15) continue;
-    // Excluir números del propio negocio
-    if (phone === '5492262317472') continue;
+    if (phone === '5492262317472') continue;  // número del local
 
     const convId = String(
       item.conversationId ?? item.inboxConversationId ?? item.inbox_conversation_id ??
@@ -229,7 +151,7 @@ async function supabaseGetExpired() {
 
 // ── YCloud: desasignar conversación (cuando pausa expira) ─────────
 async function unassignConv(convId) {
-  if (!convId) return false;
+  if (!convId || !getAuthToken()) return false;
   const payloads = [
     { conversationId: convId, unassigned: true, agentId: '', teamId: '' },
     { inboxConversationId: convId, unassigned: true },
@@ -266,7 +188,6 @@ async function handleExpiredPaused(convMap) {
 
     await supabasePatch(phone, 'ACTIVO');
 
-    // Buscar convId en el mapa de inbox y desasignar en YCloud
     let convId = null;
     for (const v of phoneVariants(phone)) {
       if (convMap[v]) { convId = convMap[v]; break; }
@@ -278,25 +199,14 @@ async function handleExpiredPaused(convMap) {
 
 // ── Loop principal de polling ─────────────────────────────────────
 async function poll() {
-  // Re-auth periódico (cada 3h)
-  if (Date.now() - lastAuth > REAUTH_MS) {
-    log('re-autenticando por timeout');
-    await authenticate();
-  }
-
   const data = await fetchInbox();
 
-  if (data === null) {
-    warn('401 — re-autenticando');
-    await authenticate();
-    return;
-  }
-  if (!data) return;  // error de red, reintentar en próximo tick
+  if (data === null) return;  // 401 ya logueado con instrucciones
+  if (!data) return;          // error de red, reintentar en próximo tick
 
   const conversations = parseConversations(data);
   log(`inbox: ${conversations.length} conversaciones`);
 
-  // Mapa convId para unassign de pausas expiradas
   const convMap = {};
   for (const c of conversations) {
     for (const v of phoneVariants(c.phone)) convMap[v] = c.convId;
@@ -306,12 +216,11 @@ async function poll() {
     const prev = prevStates[phone];
 
     if (prev === undefined) {
-      // Primera vez que vemos esta conv — solo registrar, sin cambiar Supabase
       prevStates[phone] = { isAssigned, agentId, convId };
       continue;
     }
 
-    const cambioAAsignado   = !prev.isAssigned && isAssigned;
+    const cambioAAsignado    = !prev.isAssigned && isAssigned;
     const cambioADesasignado = prev.isAssigned && !isAssigned;
 
     if (cambioAAsignado) {
@@ -326,7 +235,6 @@ async function poll() {
     prevStates[phone] = { isAssigned, agentId, convId };
   }
 
-  // Chequear pausas expiradas
   await handleExpiredPaused(convMap);
 }
 
@@ -344,15 +252,17 @@ async function expiryLoop() {
 async function main() {
   log('iniciando NecoBot YCloud Watcher');
 
-  // El loop de expiración corre siempre, independiente del auth YCloud
+  const token = getAuthToken();
+  if (token) {
+    log('YC_TOKEN detectado — detección de asignaciones activa');
+  } else {
+    log('YC_TOKEN ausente — solo loop de expiración activo');
+  }
+
+  // Loop de expiración siempre activo, independiente del token YCloud
   expiryLoop();
 
-  const ok = await authenticate();
-  if (!ok) {
-    warn('auth fallida — expiración activa, asignaciones pendientes. reintentando en 60s...');
-    setTimeout(main, 60_000);
-    return;
-  }
+  if (!token) return;
 
   async function loop() {
     try {

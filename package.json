@@ -1,12 +1,10 @@
 {
   "name": "necobot-watcher",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "YCloud inbox watcher — detecta asignaciones y actualiza Supabase",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {
-    "puppeteer": "^21.11.0"
-  }
+  "dependencies": {}
 }
