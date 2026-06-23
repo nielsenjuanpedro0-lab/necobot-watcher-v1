@@ -330,13 +330,26 @@ async function poll() {
   await handleExpiredPaused(convMap);
 }
 
+// ── Loop independiente de expiración (no requiere auth YCloud) ───
+async function expiryLoop() {
+  try {
+    await handleExpiredPaused({});  // convMap vacío — sin desasignar en YCloud
+  } catch (e) {
+    warn('expiryLoop error:', e.message);
+  }
+  setTimeout(expiryLoop, 30_000);  // cada 30s
+}
+
 // ── Arranque ──────────────────────────────────────────────────────
 async function main() {
   log('iniciando NecoBot YCloud Watcher');
 
+  // El loop de expiración corre siempre, independiente del auth YCloud
+  expiryLoop();
+
   const ok = await authenticate();
   if (!ok) {
-    warn('auth fallida. reintentando en 60s...');
+    warn('auth fallida — expiración activa, asignaciones pendientes. reintentando en 60s...');
     setTimeout(main, 60_000);
     return;
   }
